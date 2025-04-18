@@ -1,6 +1,6 @@
 [package]
 name = "sniffer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Hervé Beraud <herveberaud.pro@gmail.com>"]
 description = "A tool for detecting SNI-based network blocking and censorship"
