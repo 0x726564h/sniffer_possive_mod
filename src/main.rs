@@ -15,6 +15,7 @@ use std::convert::TryFrom;
 use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use x509_parser;
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "SNI blocking detection tool", long_about = None)]
@@ -84,7 +85,7 @@ async fn main() -> Result<()> {
     let mut domain_futures = FuturesUnordered::new();
     
     // Add each domain to process
-    for domain in cli.domains {
+    for domain in cli.domains.clone() {
         domain_futures.push(process_domain(
             domain, 
             cli.ip, 
@@ -92,15 +93,42 @@ async fn main() -> Result<()> {
         ));
     }
     
+    // Initialize progress bar only when multiple domains are being analyzed
+    let pb = if cli.domains.len() > 1 && cli.output != OutputFormat::Silent && cli.output != OutputFormat::Json {
+        let pb = ProgressBar::new(cli.domains.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) Domain: {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-")
+        );
+        Some(pb)
+    } else {
+        None
+    };
+    
     // Limit concurrency if needed
     let mut results = Vec::new();
     while let Some(result) = domain_futures.next().await {
-        results.push(result?);
+        let result = result?;
+        
+        // Update progress bar if it exists
+        if let Some(pb) = &pb {
+            pb.set_message(result.domain.clone());
+            pb.inc(1);
+        }
+        
+        results.push(result);
         
         // Optional: add logic to limit concurrency
         if domain_futures.len() > cli.max_concurrency {
             // Wait for at least one domain to be processed before adding more
         }
+    }
+    
+    // Finish progress bar if it exists
+    if let Some(pb) = pb {
+        pb.finish_with_message("Processing complete");
     }
     
     // Display results according to the requested format
