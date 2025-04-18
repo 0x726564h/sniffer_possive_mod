@@ -1,0 +1,29 @@
+[package]
+name = "sniffer"
+version = "0.1.0"
+edition = "2024"
+authors = ["Hervé Beraud <herveberaud.pro@gmail.com>"]
+description = "A tool for detecting SNI-based network blocking and censorship"
+license = "LGPL-2.1"
+readme = "README.md"
+repository = "https://github.com/4383/sniffer"
+keywords = ["sni", "network", "security", "censorship", "tls"]
+categories = ["command-line-utilities", "network-programming", "cryptography", "security"]
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+rustls = "0.21"
+tokio-rustls = "0.24"
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+trust-dns-resolver = "0.23"
+webpki-roots = "0.25"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+indicatif = "0.17"
+colored = "2.1"
+x509-parser = "0.15"
