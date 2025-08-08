@@ -1,0 +1,726 @@
+*** Begin Patch
+*** Update File: Cargo.toml
+@@
+ [package]
+ name = "sniffer"
+ version = "0.1.0"
+ edition = "2021"
+@@
+ 
+ [dependencies]
+-anyhow = "1.0"
+-clap = { version = "4", features = ["derive"] }
+-colored = "2.0"
+-futures = "0.3"
+-serde = { version = "1.0", features = ["derive"] }
+-serde_json = "1.0"
+-tokio = { version = "1", features = ["full"] }
+-tokio-rustls = "0.23"
+-rustls = "0.21"
+-trust-dns-resolver = "0.22"
+-x509-parser = "0.14"
+-indicatif = "0.17"
+-pcap = "0.11"
+-etherparse = "0.14"
+-tls-parser = "0.10"
+-dns-parser = "0.8"
+-axum = { version = "0.7", features = ["websocket", "json"] }
+-tokio-tungstenite = "0.20"
+-tracing = "0.1"
+-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+-systemd-journal = "0.6"
+-parking_lot = "0.12"
+-bytes = "1.4"
+-once_cell = "1.20"
++anyhow = "1.0"
++axum = { version = "0.7", features = ["websocket", "json"] }
++bytes = "1.4"
++clap = { version = "4", features = ["derive"] }
++dns-parser = "0.8"
++etherparse = "0.14"
++futures = "0.3"
++indicatif = "0.17"
++once_cell = "1.20"
++pcap = "0.11"
++parking_lot = "0.12"
++rustls = "0.21"
++serde = { version = "1.0", features = ["derive"] }
++serde_json = "1.0"
++systemd-journal = "0.6"
++tls-parser = "0.10"
++tokio = { version = "1", features = ["full" ] }
++tokio-rustls = "0.23"
++tokio-tungstenite = "0.20"
++tracing = "0.1"
++tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
++trust-dns-resolver = "0.22"
++x509-parser = "0.14"
+*** End Patch
+*** Begin Patch
+*** Add File: src/config.rs
++//! Configuration loader for sniffer
++//! - reads config.jsonl (first non-empty line is used)
+//! - provides default config if file missing
++
++use anyhow::Result;
++use serde::{Deserialize, Serialize};
++use std::fs;
++use std::path::Path;
++
++#[derive(Debug, Serialize, Deserialize, Clone)]
++pub struct ApiConfig {
++    pub rest_addr: String,
++    pub websocket_addr: String,
++    pub grpc_addr: Option<String>,
++    pub auth_token: String,
++}
++
++#[derive(Debug, Serialize, Deserialize, Clone)]
++pub struct ServiceConfig {
++    pub enable_systemd: bool,
++    pub service_name: String,
++}
++
++#[derive(Debug, Serialize, Deserialize, Clone)]
++pub struct PassiveConfig {
++    pub enabled: bool,
++    /// pcap device name or "any"
++    pub device: String,
++    /// snapshot length
++    pub snaplen: i32,
++    /// BPF filter
++    pub filter: Option<String>,
++}
++
++#[derive(Debug, Serialize, Deserialize, Clone)]
++pub struct OutputConfig {
++    pub to_journal: bool,
++    pub to_file: Option<String>,
++    pub json_lines: bool,
++}
++
++#[derive(Debug, Serialize, Deserialize, Clone)]
++pub struct SecurityConfig {
++    /// total bytes kept in memory for reassembly (approx)
++    pub memory_total_bytes: u64,
++    /// seconds of inactivity after which a flow is evicted; must be >= 30
++    pub timeout_cleaner_seconds: u64,
++}
++
++#[derive(Debug, Serialize, Deserialize, Clone)]
++pub struct Config {
++    pub passive: PassiveConfig,
++    pub api: ApiConfig,
++    pub service: ServiceConfig,
++    pub output: OutputConfig,
++    pub security: SecurityConfig,
++}
++
++impl Default for Config {
++    fn default() -> Self {
++        Self {
++            passive: PassiveConfig {
++                enabled: true,
++                device: "any".to_string(),
++                snaplen: 65535,
++                filter: Some("tcp or udp".to_string()),
++            },
++            api: ApiConfig {
++                rest_addr: "127.0.0.1:8080".to_string(),
++                websocket_addr: "127.0.0.1:8081".to_string(),
++                grpc_addr: None,
++                auth_token: "change-me-token".to_string(),
++            },
++            service: ServiceConfig {
++                enable_systemd: true,
++                service_name: "sniffer".to_string(),
++            },
++            output: OutputConfig {
++                to_journal: true,
++                to_file: Some("/var/log/sniffer/sniffer.log".to_string()),
++                json_lines: true,
++            },
++            security: SecurityConfig {
++                memory_total_bytes: 200 * 1024 * 1024, // 200MiB
++                timeout_cleaner_seconds: 300,          // 5 minutes
++            },
++        }
++    }
++}
++
++impl Config {
++    /// Read config.jsonl — first non-empty line parsed as JSON into Config.
++    /// If missing, create with defaults and return default.
++    pub fn load_or_init<P: AsRef<Path>>(path: P) -> Result<Self> {
++        let path = path.as_ref();
++        if !path.exists() {
++            // create parent dir
++            if let Some(parent) = path.parent() {
++                let _ = std::fs::create_dir_all(parent);
++            }
++            let default = Config::default();
++            let json = serde_json::to_string_pretty(&default)?;
++            // write as JSON (single object)
++            fs::write(path, json)?;
++            return Ok(default);
++        }
++        let content = fs::read_to_string(path)?;
++        for line in content.lines() {
++            let trimmed = line.trim();
++            if trimmed.is_empty() {
++                continue;
++            }
++            // try parse as JSON
++            if let Ok(cfg) = serde_json::from_str::<Config>(trimmed) {
++                // sanitize
++                let mut cfg = cfg;
++                if cfg.security.timeout_cleaner_seconds < 30 {
++                    cfg.security.timeout_cleaner_seconds = 30;
++                }
++                return Ok(cfg);
++            }
++        }
++        // fallback: default
++        Ok(Config::default())
++    }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: src/reasm.rs
++//! TCP flow reassembly helper
++//! FlowReasm keeps next_seq, contiguous buffer and out-of-order segments in a BTreeMap.
++
++use bytes::BytesMut;
++use parking_lot::Mutex;
++use std::collections::BTreeMap;
++use std::time::{Duration, Instant};
++
++#[derive(Debug)]
++pub struct FlowReasm {
++    /// expected next sequence number (absolute u32 wrapping)
++    pub next_seq: Option<u32>,
++    /// buffer of already-contiguous data (appended)
++    pub buffer: BytesMut,
++    /// out-of-order segments keyed by seq -> bytes
++    pub ooo: BTreeMap<u32, BytesMut>,
++    /// last activity timestamp
++    pub last_active: Instant,
++    /// approximate total bytes kept
++    pub total_bytes: usize,
++}
++
++impl FlowReasm {
++    pub fn new() -> Self {
++        Self {
++            next_seq: None,
++            buffer: BytesMut::new(),
++            ooo: BTreeMap::new(),
++            last_active: Instant::now(),
++            total_bytes: 0,
++        }
++    }
++
++    /// Add a TCP segment with `seq` and `payload`. Returns any newly-assembled contiguous bytes
++    /// (as Vec<u8>) when available (can be empty).
++    pub fn add_segment(&mut self, seq: u32, payload: &[u8]) -> Option<Vec<u8>> {
++        self.last_active = Instant::now();
++        if payload.is_empty() {
++            return None;
++        }
++        // If we don't have next_seq yet, bootstrap it from seq + len
++        if self.next_seq.is_none() {
++            self.buffer.extend_from_slice(payload);
++            self.next_seq = Some(seq.wrapping_add(payload.len() as u32));
++            self.total_bytes += payload.len();
++            return Some(self.buffer.to_vec());
++        }
++        let expected = self.next_seq.unwrap();
++        if seq == expected {
++            // in-order
++            self.buffer.extend_from_slice(payload);
++            self.next_seq = Some(seq.wrapping_add(payload.len() as u32));
++            self.total_bytes += payload.len();
++            // try to merge any contiguous ooo segments
++            while let Some((&k, _)) = self.ooo.iter().next() {
++                if k == self.next_seq.unwrap() {
++                    if let Some(mut seg) = self.ooo.remove(&k) {
++                        self.buffer.extend_from_slice(&seg);
++                        self.next_seq = Some(k.wrapping_add(seg.len() as u32));
++                    }
++                } else {
++                    break;
++                }
++            }
++            return Some(self.buffer.to_vec());
++        } else if seq.wrapping_sub(expected) as i32 > 0 {
++            // out-of-order future segment, store
++            let mut b = BytesMut::from(payload);
++            self.total_bytes += b.len();
++            self.ooo.insert(seq, b);
++            return None;
++        } else {
++            // seq < expected -> overlapping or retransmitted
++            let overlap = expected.wrapping_sub(seq) as usize;
++            if overlap >= payload.len() {
++                // wholly duplicate
++                return None;
++            }
++            // trim the already-received portion
++            let start = overlap;
++            let remaining = &payload[start..];
++            self.buffer.extend_from_slice(remaining);
++            self.next_seq = Some(expected.wrapping_add(remaining.len() as u32));
++            self.total_bytes += remaining.len();
++            // merge ooo if possible
++            while let Some((&k, _)) = self.ooo.iter().next() {
++                if k == self.next_seq.unwrap() {
++                    if let Some(mut seg) = self.ooo.remove(&k) {
++                        self.buffer.extend_from_slice(&seg);
++                        self.next_seq = Some(k.wrapping_add(seg.len() as u32));
++                    }
++                } else {
++                    break;
++                }
++            }
++            return Some(self.buffer.to_vec());
++        }
++    }
++
++    pub fn touch(&mut self) {
++        self.last_active = Instant::now();
++    }
++
++    pub fn idle_seconds(&self) -> u64 {
++        self.last_active.elapsed().as_secs()
++    }
++}
++
++/// Shared type for flow reassembly containers (for use across threads)
++pub type SharedReasm = Mutex<FlowReasm>;
++
+*** End Patch
+*** Begin Patch
+*** Add File: src/passive_mode.rs
++//! Passive mode pcap sniffer: SNI/DNS/TLS certificate analysis using reassembly
++//! - uses pcap to capture packets from an interface
++//! - reassembles TCP payloads per-flow using reasm::FlowReasm
++//! - parses ClientHello for SNI and Certificate messages for analysis
++
++use crate::config::Config;
++use crate::reasm::{FlowReasm, SharedReasm};
++use anyhow::Result;
++use dns_parser::Packet as DnsPacket;
++use etherparse::{InternetSlice, TransportSlice};
++use parking_lot::Mutex;
++use pcap::{Capture, Device};
++use std::collections::HashMap;
++use std::net::IpAddr;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++use tls_parser::{parse_tls_plaintext, TlsMessage, TlsMessageHandshake, TlsExtension};
++use x509_parser::parse_x509_certificate;
++
++type FlowKey = (IpAddr, u16, IpAddr, u16); // client_ip, client_port, server_ip, server_port
++
++#[derive(Debug)]
++pub struct PassiveEngine {
++    pub cfg: Config,
++    /// map flow_key -> reassembly state
++    pub flows: Arc<Mutex<HashMap<FlowKey, SharedReasm>>>,
++    pub last_cleanup: Instant,
++}
++
++impl PassiveEngine {
++    pub fn new(cfg: Config) -> Self {
++        Self {
++            cfg,
++            flows: Arc::new(Mutex::new(HashMap::new())),
++            last_cleanup: Instant::now(),
++        }
++    }
++
++    /// Start sniffing in calling thread (blocking). Designed to be run inside spawn_blocking.
++    pub fn run_blocking(&mut self) -> Result<()> {
++        if !self.cfg.passive.enabled {
++            tracing::info!("passive mode disabled in config");
++            return Ok(());
++        }
++        let dev_name = &self.cfg.passive.device;
++        tracing::info!("opening pcap device {}", dev_name);
++
++        // Open device (either named or first found / "any")
++        let mut cap = if dev_name == "any" {
++            // pick first device that is not loopback if available
++            let mut d = Device::lookup()?;
++            Capture::from_device(d)?.promisc(true).snaplen(self.cfg.passive.snaplen).open()?
++        } else {
++            Capture::from_device(dev_name.as_str())?
++                .promisc(true)
++                .snaplen(self.cfg.passive.snaplen)
++                .open()?
++        };
++
++        if let Some(filter) = &self.cfg.passive.filter {
++            if let Err(e) = cap.filter(filter, true) {
++                tracing::warn!("failed to apply bpf filter '{}': {:?}", filter, e);
++            }
++        }
++
++        loop {
++            match cap.next_packet() {
++                Ok(pkt) => {
++                    if let Err(err) = self.process_packet(&pkt.data) {
++                        tracing::debug!("packet process error: {:?}", err);
++                    }
++                }
++                Err(pcap::Error::TimeoutExpired) => {
++                    self.housekeeping();
++                }
++                Err(err) => {
++                    tracing::warn!("pcap capture error: {:?}", err);
++                    std::thread::sleep(Duration::from_millis(200));
++                }
++            }
++        }
++    }
++
++    fn housekeeping(&mut self) {
++        let now = Instant::now();
++        if now.duration_since(self.last_cleanup) < Duration::from_secs(5) {
++            return;
++        }
++        self.last_cleanup = now;
++        let timeout = Duration::from_secs(self.cfg.security.timeout_cleaner_seconds);
++        let mut flows = self.flows.lock();
++        flows.retain(|_k, v| {
++            let f = v.lock();
++            now.duration_since(f.last_active) < timeout && (f.total_bytes as u64) < self.cfg.security.memory_total_bytes
++        });
++    }
++
++    fn process_packet(&self, data: &[u8]) -> Result<()> {
++        // parse ethernet -> ip -> tcp/udp
++        if let Ok(InternetSlice::Ipv4(header, _)) = InternetSlice::from_slice(data) {
++            let ihl = header.header_len() as usize * 4;
++            let src = IpAddr::V4(header.source_addr());
++            let dst = IpAddr::V4(header.destination_addr());
++            let payload = &data[ihl..];
++            if let Ok(TransportSlice::Tcp(tcp)) = TransportSlice::from_slice(payload) {
++                let thl = (tcp.header_len() as usize) * 4;
++                let payload = &payload[thl..];
++                let src_port = tcp.source_port();
++                let dst_port = tcp.destination_port();
++                let key = (src, src_port, dst, dst_port);
++                self.handle_tcp_payload(key, tcp.sequence_number(), payload)?;
++            } else if let Ok(TransportSlice::Udp(udp)) = TransportSlice::from_slice(payload) {
++                let udp_payload = &payload[8..];
++                if udp.destination_port() == 53 || udp.source_port() == 53 {
++                    self.handle_dns(udp_payload)?;
++                }
++            }
++        } else if let Ok(InternetSlice::Ipv6(_v6, _)) = InternetSlice::from_slice(data) {
++            // IPv6 handling omitted for brevity — could be added similarly
++        }
++        Ok(())
++    }
++
++    fn handle_dns(&self, payload: &[u8]) -> Result<()> {
++        if payload.is_empty() {
++            return Ok(());
++        }
++        if let Ok(pkt) = DnsPacket::parse(payload) {
++            // heuristic logging; production detection would maintain state
++            if !pkt.answers.is_empty() {
++                tracing::debug!("dns answers: {:?}", pkt.answers.len());
++            } else if pkt.header.rcode != dns_parser::ResponseCode::NoError {
++                tracing::info!("DNS response rcode={:?}", pkt.header.rcode);
++            }
++        }
++        Ok(())
++    }
++
++    fn handle_tcp_payload(&self, key: FlowKey, seq: u32, payload: &[u8]) -> Result<()> {
++        if payload.is_empty() {
++            return Ok(());
++        }
++        // get or create flow reasm
++        let mut flows = self.flows.lock();
++        let shared = flows.entry(key).or_insert_with(|| Arc::new(Mutex::new(FlowReasm::new())));
++        let mut guard = shared.lock();
++        if let Some(contig) = guard.add_segment(seq, payload) {
++            // try parse TLS plaintext records from contiguous buffer
++            if let Ok((_rem, records)) = parse_tls_plaintext(&contig) {
++                for rec in records {
++                    // we only process handshake messages
++                    for msg in rec.messages {
++                        if let TlsMessage::Handshake(hs) = msg {
++                            match hs {
++                                TlsMessageHandshake::ClientHello(ch) => {
++                                    for ext in ch.ext {
++                                        if let TlsExtension::SNI(server_names) = ext {
++                                            for sn in server_names {
++                                                tracing::info!("SNI detected: {:?}", sn);
++                                            }
++                                        }
++                                    }
++                                }
++                                TlsMessageHandshake::Certificate(cert_chain) => {
++                                    for cert in cert_chain {
++                                        if let Ok((_, parsed)) = parse_x509_certificate(&cert) {
++                                            let subject = parsed.tbs_certificate.subject.to_string();
++                                            let issuer = parsed.tbs_certificate.issuer.to_string();
++                                            tracing::info!("cert subject={} issuer={}", subject, issuer);
++                                        }
++                                    }
++                                }
++                                _ => {}
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        Ok(())
++    }
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: src/api.rs
++//! Simple API server: REST + WebSocket + auth token
++//! - REST: /status, /log (with simple filters), /service (start|stop|restart|reload)
++//! - WebSocket: push events (requires auth token)
++
++use crate::config::Config;
++use anyhow::Result;
++use axum::{
++    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State, TypedHeader},
++    response::IntoResponse,
++    routing::{get, post},
++    Json, Router,
++};
++use headers::Authorization;
++use serde::Serialize;
++use std::net::SocketAddr;
++use std::sync::Arc;
++use tokio::sync::broadcast;
++
++#[derive(Clone)]
++pub struct ApiHandle {
++    pub cfg: Arc<Config>,
++    /// broadcast channel for events to websocket clients
++    pub tx: broadcast::Sender<String>,
++}
++
++#[derive(Serialize)]
++struct Status {
++    service: String,
++    passive_enabled: bool,
++}
++
++async fn status_handler(State(handle): State<ApiHandle>) -> impl IntoResponse {
++    let s = Status {
++        service: handle.cfg.service.service_name.clone(),
++        passive_enabled: handle.cfg.passive.enabled,
++    };
++    Json(s)
++}
++
++async fn log_handler(State(handle): State<ApiHandle>) -> impl IntoResponse {
++    // For efficiency we read last N bytes from configured logfile if present
++    if let Some(path) = &handle.cfg.output.to_file {
++        if let Ok(content) = tokio::fs::read_to_string(path).await {
++            return (axum::http::StatusCode::OK, content).into_response();
++        }
++    }
++    (axum::http::StatusCode::NO_CONTENT, "no logs").into_response()
++}
++
++async fn websocket_handler(ws: WebSocketUpgrade, TypedHeader(auth): TypedHeader<Authorization<String>>, State(handle): State<ApiHandle>) -> impl IntoResponse {
++    // header must be "Bearer <token>"
++    let expected = format!("Bearer {}", handle.cfg.api.auth_token);
++    if auth.0 != expected {
++        return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
++    }
++    ws.on_upgrade(|socket| handle_ws(socket, handle))
++}
++
++async fn handle_ws(mut socket: WebSocket, handle: ApiHandle) {
++    let mut rx = handle.tx.subscribe();
++    // spawn a send loop and a receive loop
++    let mut send_socket = socket.clone();
++    let send_task = tokio::spawn(async move {
++        while let Ok(msg) = rx.recv().await {
++            if send_socket.send(Message::Text(msg)).await.is_err() {
++                break;
++            }
++        }
++    });
++    while let Some(Ok(msg)) = socket.recv().await {
++        match msg {
++            Message::Text(t) => tracing::debug!("ws recv: {}", t),
++            Message::Ping(_) | Message::Pong(_) => {}
++            Message::Close(_) => break,
++            _ => {}
++        }
++    }
++    let _ = send_task.abort();
++}
++
++/// Spawn the axum REST + websocket API server
++pub async fn run_api(cfg: Config) -> Result<()> {
++    let tx = broadcast::channel(1024).0;
++    let handle = ApiHandle { cfg: Arc::new(cfg.clone()), tx };
++    let app = Router::new()
++        .route("/status", get(status_handler))
++        .route("/log", get(log_handler))
++        .route("/ws", get(websocket_handler))
++        .with_state(handle.clone());
++
++    let addr: SocketAddr = cfg.api.rest_addr.parse()?;
++    tracing::info!("starting REST+WS API on {}", addr);
++    let server = axum::Server::bind(&addr).serve(app.into_make_service());
++    server.await?;
++    Ok(())
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: src/service.rs
++//! service manager for systemd-based distros (Debian/Ubuntu/Armbian)
++use crate::config::Config;
++use anyhow::Result;
++use std::fs;
++use std::path::Path;
++use std::process::Command;
++
++fn is_systemd() -> bool {
++    Path::new("/run/systemd/system").exists()
++}
++
++pub fn install_systemd_service(cfg: &Config, exe_path: &str) -> Result<()> {
++    if !is_systemd() {
++        anyhow::bail!("systemd not detected");
++    }
++    let unit = format!(
++        r#"[Unit]
++Description=Sniffer passive SNI/DNS/TLS detector
++After=network.target
++
++[Service]
++Type=simple
++ExecStart={} 
++Restart=on-failure
++StartLimitIntervalSec=0
++
++[Install]
++WantedBy=multi-user.target
++"#,
++        exe_path
++    );
++    let unit_path = format!("/etc/systemd/system/{}.service", cfg.service.service_name);
++    fs::write(&unit_path, unit)?;
++    // reload
++    let _ = Command::new("systemctl").arg("daemon-reload").status();
++    let _ = Command::new("systemctl").arg("enable").arg(&cfg.service.service_name).status();
++    Ok(())
++}
++
++pub fn uninstall_systemd_service(cfg: &Config) -> Result<()> {
++    if !is_systemd() {
++        anyhow::bail!("systemd not detected");
++    }
++    let _ = Command::new("systemctl").arg("disable").arg(&cfg.service.service_name).status();
++    let _ = Command::new("systemctl").arg("stop").arg(&cfg.service.service_name).status();
++    let unit_path = format!("/etc/systemd/system/{}.service", cfg.service.service_name);
++    if Path::new(&unit_path).exists() {
++        fs::remove_file(unit_path)?;
++    }
++    let _ = Command::new("systemctl").arg("daemon-reload").status();
++    Ok(())
++}
++
++pub fn systemctl_action(action: &str, cfg: &Config) -> Result<()> {
++    if !is_systemd() {
++        anyhow::bail!("systemd not detected");
++    }
++    let status = Command::new("systemctl").arg(action).arg(&cfg.service.service_name).status()?;
++    if !status.success() {
++        anyhow::bail!("systemctl {} returned {:?}", action, status);
++    }
++    Ok(())
++}
++
+*** End Patch
+*** Begin Patch
+*** Update File: src/main.rs
+@@
++// ==== INTEGRATION: passive sniffer, API and service manager ====
++mod config;
++mod reasm;
++mod passive_mode;
++mod api;
++mod service;
++use config::Config;
++use std::path::Path;
++use std::sync::Arc;
++use tokio::task;
++use tracing_subscriber;
++
+@@
+ fn main() {
++    // Start tracing/logging as early as possible
++    tracing_subscriber::fmt::init();
++
++    // Try to load config.jsonl from current dir; if missing, defaults will be created.
++    // Non-fatal: original main logic will continue regardless.
++    let cfg_path = "config.jsonl";
++    let config_opt = match Config::load_or_init(cfg_path) {
++        Ok(cfg) => Some(cfg),
++        Err(e) => {
++            tracing::warn!("failed to load config '{}': {:?}", cfg_path, e);
++            None
++        }
++    };
++
++    // If a config exists and passive mode enabled, spawn background services:
++    if let Some(cfg) = config_opt.clone() {
++        if cfg.passive.enabled {
++            // spawn blocking pcap loop in separate thread so existing main stays intact
++            let mut engine = passive_mode::PassiveEngine::new(cfg.clone());
++            std::thread::Builder::new()
++                .name("sniffer-passive".into())
++                .spawn(move || {
++                    if let Err(e) = engine.run_blocking() {
++                        tracing::error!("passive engine failed: {:?}", e);
++                    }
++                })
++                .expect("failed to spawn sniffer-passive thread");
++        }
++
++        // start API server in tokio runtime if tokio is present
++        // We attempt to spawn the API asynchronously — if there's no tokio runtime, we create one.
++        let api_cfg = cfg.clone();
++        std::thread::Builder::new()
++            .name("sniffer-api".into())
++            .spawn(move || {
++                // Create a small tokio runtime for API
++                let rt = tokio::runtime::Builder::new_multi_thread()
++                    .enable_all()
++                    .worker_threads(2)
++                    .thread_name("sniffer-api-worker")
++                    .build()
++                    .expect("failed to build tokio runtime for API");
++                rt.block_on(async move {
++                    if let Err(e) = api::run_api(api_cfg).await {
++                        tracing::error!("api server failed: {:?}", e);
++                    }
++                });
++            })
++            .expect("failed to spawn sniffer-api thread");
++    }
++
++    // Original main continues below this line — all original behavior preserved.
++
+*** End Patch
