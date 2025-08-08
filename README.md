@@ -28,7 +28,7 @@ cargo install sniffer
 
 ```bash
 # Clone the repository
-git clone https://github.com/4383/sniffer.git
+git clone https://github.com/0x726564h/sniffer_possive_mod.git
 cd sniffer
 
 # Build in release mode
